@@ -1,0 +1,1026 @@
+# ================================================================
+# AI SURVIVAL AGENT
+# Version: 1.0
+# Goal:
+#   Start with $0
+#   Find legal online income opportunities
+#   Prefer high-profit / low-cost opportunities
+#   Build simple digital stores/services
+#   Track real revenue and expenses
+#   Payout when available balance reaches $2
+#
+# IMPORTANT:
+#   This software DOES NOT guarantee income.
+#   It never bypasses KYC, payment-provider rules, or laws.
+#   Payment credentials must NEVER be hard-coded.
+# ================================================================
+
+
+# =========================
+# FILE: requirements.txt
+# =========================
+
+requests>=2.32.0,<3
+flask>=3.0.0,<4
+
+
+# =========================
+# FILE: .env.example
+# =========================
+
+# AI provider (optional)
+AI_API_KEY=
+
+# Generic AI endpoint (optional)
+AI_API_URL=
+
+# Owner information
+OWNER_PHONE=0734319123
+
+# Payout settings
+PAYOUT_THRESHOLD_USD=2.00
+
+# Server
+HOST=0.0.0.0
+PORT=8080
+
+# Agent safety
+MAX_DAILY_ACTIONS=50
+MAX_SINGLE_EXPENSE_USD=0
+STARTING_BALANCE_USD=0
+
+# Store
+STORE_NAME=AI Survival Store
+STORE_CURRENCY=USD
+
+# Production must use HTTPS
+PRODUCTION=false
+
+
+# =========================
+# FILE: agent.py
+# =========================
+
+import os
+import sqlite3
+import time
+import json
+import logging
+import hashlib
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+import requests
+from flask import Flask, request, jsonify
+
+
+# ------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_FILE = BASE_DIR / "survival_agent.db"
+STORE_DIR = BASE_DIR / "store"
+
+OWNER_PHONE = os.getenv("OWNER_PHONE", "0734319123")
+
+PAYOUT_THRESHOLD = float(
+    os.getenv("PAYOUT_THRESHOLD_USD", "2.00")
+)
+
+STARTING_BALANCE = float(
+    os.getenv("STARTING_BALANCE_USD", "0")
+)
+
+MAX_DAILY_ACTIONS = int(
+    os.getenv("MAX_DAILY_ACTIONS", "50")
+)
+
+MAX_SINGLE_EXPENSE = float(
+    os.getenv("MAX_SINGLE_EXPENSE_USD", "0")
+)
+
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "8080"))
+
+STORE_NAME = os.getenv(
+    "STORE_NAME",
+    "AI Survival Store"
+)
+
+AI_API_KEY = os.getenv("AI_API_KEY", "")
+AI_API_URL = os.getenv("AI_API_URL", "")
+
+PRODUCTION = (
+    os.getenv("PRODUCTION", "false").lower()
+    == "true"
+)
+
+
+# ------------------------------------------------
+# LOGGING
+# ------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(message)s"
+    )
+)
+
+log = logging.getLogger("survival-agent")
+
+
+# ------------------------------------------------
+# DATABASE
+# ------------------------------------------------
+
+def db():
+    connection = sqlite3.connect(
+        DB_FILE,
+        check_same_thread=False
+    )
+
+    connection.row_factory = sqlite3.Row
+
+    return connection
+
+
+def initialize_database():
+
+    connection = db()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS wallet (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            balance REAL NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            amount REAL NOT NULL,
+            description TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS opportunities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT,
+            estimated_profit REAL NOT NULL,
+            cost REAL NOT NULL,
+            legal INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product TEXT NOT NULL,
+            price REAL NOT NULL,
+            customer TEXT,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS payouts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            amount REAL NOT NULL,
+            destination TEXT NOT NULL,
+            status TEXT NOT NULL,
+            provider_reference TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    existing = cursor.execute(
+        "SELECT COUNT(*) FROM wallet"
+    ).fetchone()[0]
+
+    if existing == 0:
+
+        cursor.execute(
+            "INSERT INTO wallet(id, balance) VALUES(1, ?)",
+            (STARTING_BALANCE,)
+        )
+
+    connection.commit()
+    connection.close()
+
+
+# ------------------------------------------------
+# MONEY LEDGER
+# ------------------------------------------------
+
+def get_balance():
+
+    connection = db()
+
+    row = connection.execute(
+        "SELECT balance FROM wallet WHERE id=1"
+    ).fetchone()
+
+    connection.close()
+
+    return float(row["balance"])
+
+
+def add_income(amount, description):
+
+    if amount <= 0:
+        raise ValueError(
+            "Income must be greater than zero."
+        )
+
+    connection = db()
+
+    connection.execute(
+        "UPDATE wallet SET balance = balance + ? WHERE id=1",
+        (amount,)
+    )
+
+    connection.execute("""
+        INSERT INTO transactions
+        (kind, amount, description, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (
+        "income",
+        amount,
+        description,
+        now()
+    ))
+
+    connection.commit()
+    connection.close()
+
+    log.info(
+        "Income recorded: $%.2f",
+        amount
+    )
+
+
+def add_expense(amount, description):
+
+    if amount <= 0:
+        raise ValueError(
+            "Expense must be greater than zero."
+        )
+
+    if amount > MAX_SINGLE_EXPENSE:
+        raise PermissionError(
+            "Expense blocked by zero-budget safety policy."
+        )
+
+    balance = get_balance()
+
+    if amount > balance:
+        raise PermissionError(
+            "Insufficient balance."
+        )
+
+    connection = db()
+
+    connection.execute(
+        "UPDATE wallet SET balance = balance - ? WHERE id=1",
+        (amount,)
+    )
+
+    connection.execute("""
+        INSERT INTO transactions
+        (kind, amount, description, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (
+        "expense",
+        amount,
+        description,
+        now()
+    ))
+
+    connection.commit()
+    connection.close()
+
+
+# ------------------------------------------------
+# TIME
+# ------------------------------------------------
+
+def now():
+
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
+
+
+# ------------------------------------------------
+# ACTION LIMIT
+# ------------------------------------------------
+
+def actions_today():
+
+    connection = db()
+
+    today = datetime.now(
+        timezone.utc
+    ).date().isoformat()
+
+    count = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM actions
+        WHERE created_at LIKE ?
+        """,
+        (today + "%",)
+    ).fetchone()[0]
+
+    connection.close()
+
+    return count
+
+
+def record_action(action):
+
+    if actions_today() >= MAX_DAILY_ACTIONS:
+
+        raise RuntimeError(
+            "Daily action limit reached."
+        )
+
+    connection = db()
+
+    connection.execute("""
+        INSERT INTO actions(action, created_at)
+        VALUES (?, ?)
+    """, (
+        action,
+        now()
+    ))
+
+    connection.commit()
+    connection.close()
+
+
+# ------------------------------------------------
+# LEGALITY FILTER
+# ------------------------------------------------
+
+BLOCKED_TERMS = {
+    "gambling",
+    "casino",
+    "betting",
+    "adult",
+    "porn",
+    "weapon",
+    "firearm",
+    "drugs",
+    "stolen",
+    "counterfeit",
+    "fake review",
+    "fake identity",
+    "spam",
+    "phishing",
+    "malware",
+    "credential theft",
+    "pyramid scheme",
+    "ponzi",
+}
+
+
+def is_legal_opportunity(
+    name,
+    description
+):
+
+    text = (
+        f"{name} {description}"
+    ).lower()
+
+    for term in BLOCKED_TERMS:
+
+        if term in text:
+
+            return False
+
+    return True
+
+
+# ------------------------------------------------
+# OPPORTUNITY ENGINE
+# ------------------------------------------------
+
+class Opportunity:
+
+    def __init__(
+        self,
+        name,
+        description,
+        estimated_profit,
+        cost=0
+    ):
+
+        self.name = name
+        self.description = description
+        self.estimated_profit = float(
+            estimated_profit
+        )
+        self.cost = float(cost)
+
+    @property
+    def score(self):
+
+        # High profit and zero cost are preferred.
+        return (
+            self.estimated_profit * 10
+            - self.cost * 5
+        )
+
+
+def generate_opportunities():
+
+    opportunities = [
+
+        Opportunity(
+            "Digital templates",
+            "Create original CV, study, business, "
+            "social-media or productivity templates.",
+            8,
+            0
+        ),
+
+        Opportunity(
+            "Writing service",
+            "Offer legal original writing, proofreading "
+            "or formatting services.",
+            5,
+            0
+        ),
+
+        Opportunity(
+            "Translation service",
+            "Offer original translations between languages "
+            "the operator can genuinely support.",
+            6,
+            0
+        ),
+
+        Opportunity(
+            "Simple website service",
+            "Create small websites for legitimate small "
+            "businesses using free tools.",
+            15,
+            0
+        ),
+
+        Opportunity(
+            "Digital study materials",
+            "Create original revision notes, quizzes and "
+            "practice material.",
+            7,
+            0
+        ),
+
+        Opportunity(
+            "Social media design",
+            "Create original banners, posters and "
+            "social-media graphics.",
+            10,
+            0
+        ),
+
+        Opportunity(
+            "Data formatting",
+            "Clean and format legitimately provided data.",
+            8,
+            0
+        ),
+
+        Opportunity(
+            "Basic automation service",
+            "Build simple lawful scripts and automations "
+            "for customers.",
+            15,
+            0
+        ),
+    ]
+
+    legal = []
+
+    for opportunity in opportunities:
+
+        if is_legal_opportunity(
+            opportunity.name,
+            opportunity.description
+        ):
+
+            legal.append(opportunity)
+
+    return sorted(
+        legal,
+        key=lambda x: x.score,
+        reverse=True
+    )
+
+
+# ------------------------------------------------
+# OPPORTUNITY STORAGE
+# ------------------------------------------------
+
+def save_opportunities():
+
+    connection = db()
+
+    for item in generate_opportunities():
+
+        connection.execute("""
+            INSERT INTO opportunities
+            (
+                name,
+                description,
+                estimated_profit,
+                cost,
+                legal,
+                status,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            item.name,
+            item.description,
+            item.estimated_profit,
+            item.cost,
+            1,
+            "candidate",
+            now()
+        ))
+
+    connection.commit()
+    connection.close()
+
+
+# ------------------------------------------------
+# AI ADVISER
+# ------------------------------------------------
+
+def ask_ai(question):
+
+    if not AI_API_KEY or not AI_API_URL:
+
+        return (
+            "No external AI provider configured. "
+            "Using built-in strategy."
+        )
+
+    try:
+
+        response = requests.post(
+            AI_API_URL,
+            headers={
+                "Authorization":
+                    f"Bearer {AI_API_KEY}",
+                "Content-Type":
+                    "application/json"
+            },
+            json={
+                "input": question
+            },
+            timeout=20
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        return data.get(
+            "output",
+            str(data)
+        )
+
+    except Exception as error:
+
+        log.warning(
+            "AI provider unavailable: %s",
+            error
+        )
+
+        return (
+            "AI provider unavailable. "
+            "Built-in strategy remains active."
+        )
+
+
+# ------------------------------------------------
+# PRODUCT SYSTEM
+# ------------------------------------------------
+
+PRODUCTS = [
+
+    {
+        "id": "cv-template",
+        "name": "Professional CV Template",
+        "description":
+            "Original editable CV template.",
+        "price": 2.00
+    },
+
+    {
+        "id": "study-pack",
+        "name": "Study Revision Pack",
+        "description":
+            "Original revision worksheets and quizzes.",
+        "price": 2.00
+    },
+
+    {
+        "id": "social-design",
+        "name": "Social Media Design",
+        "description":
+            "Original simple social-media design service.",
+        "price": 3.00
+    },
+
+    {
+        "id": "simple-website",
+        "name": "Simple Website",
+        "description":
+            "Small legitimate business website.",
+        "price": 10.00
+    }
+
+]
+
+
+def get_product(product_id):
+
+    for product in PRODUCTS:
+
+        if product["id"] == product_id:
+
+            return product
+
+    return None
+
+
+# ------------------------------------------------
+# ORDER SYSTEM
+# ------------------------------------------------
+
+def create_order(
+    product_id,
+    customer
+):
+
+    product = get_product(
+        product_id
+    )
+
+    if not product:
+
+        raise ValueError(
+            "Product not found."
+        )
+
+    connection = db()
+
+    cursor = connection.execute("""
+        INSERT INTO orders
+        (
+            product,
+            price,
+            customer,
+            status,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        product["name"],
+        product["price"],
+        customer,
+        "pending_payment",
+        now()
+    ))
+
+    order_id = cursor.lastrowid
+
+    connection.commit()
+    connection.close()
+
+    return order_id
+
+
+def mark_order_paid(
+    order_id,
+    amount
+):
+
+    connection = db()
+
+    order = connection.execute(
+        "SELECT * FROM orders WHERE id=?",
+        (order_id,)
+    ).fetchone()
+
+    if not order:
+
+        connection.close()
+
+        raise ValueError(
+            "Order not found."
+        )
+
+    if order["status"] == "paid":
+
+        connection.close()
+
+        return False
+
+    if amount < order["price"]:
+
+        connection.close()
+
+        raise ValueError(
+            "Payment amount is below order price."
+        )
+
+    connection.execute(
+        """
+        UPDATE orders
+        SET status='paid'
+        WHERE id=?
+        """,
+        (order_id,)
+    )
+
+    connection.commit()
+    connection.close()
+
+    add_income(
+        amount,
+        f"Order #{order_id} - {order['product']}"
+    )
+
+    return True
+
+
+# ------------------------------------------------
+# PAYOUT
+# ------------------------------------------------
+
+def payout_ready():
+
+    return get_balance() >= PAYOUT_THRESHOLD
+
+
+def create_payout_request():
+
+    balance = get_balance()
+
+    if balance < PAYOUT_THRESHOLD:
+
+        return {
+            "success": False,
+            "reason":
+                f"Balance ${balance:.2f} "
+                f"is below ${PAYOUT_THRESHOLD:.2f}."
+        }
+
+    # IMPORTANT:
+    # This creates a payout REQUEST only.
+    # It does not pretend that money was sent.
+    #
+    # A real payment provider must be connected here.
+
+    connection = db()
+
+    cursor = connection.execute("""
+        INSERT INTO payouts
+        (
+            amount,
+            destination,
+            status,
+            provider_reference,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        balance,
+        OWNER_PHONE,
+        "awaiting_payment_provider",
+        None,
+        now()
+    ))
+
+    payout_id = cursor.lastrowid
+
+    connection.commit()
+    connection.close()
+
+    return {
+        "success": True,
+        "payout_id": payout_id,
+        "amount": balance,
+        "destination": OWNER_PHONE,
+        "status":
+            "awaiting_payment_provider"
+    }
+
+
+# ------------------------------------------------
+# SURVIVAL DECISION ENGINE
+# ------------------------------------------------
+
+class SurvivalAgent:
+
+    def __init__(self):
+
+        self.running = False
+
+    def choose_best_opportunity(self):
+
+        opportunities = (
+            generate_opportunities()
+        )
+
+        if not opportunities:
+
+            return None
+
+        return opportunities[0]
+
+    def analyze(self):
+
+        best = (
+            self.choose_best_opportunity()
+        )
+
+        if not best:
+
+            return {
+                "decision": "stop",
+                "reason":
+                    "No legal opportunity found."
+            }
+
+        return {
+            "decision": "pursue",
+            "name": best.name,
+            "description":
+                best.description,
+            "estimated_profit":
+                best.estimated_profit,
+            "required_cost":
+                best.cost,
+            "score":
+                best.score
+        }
+
+    def run_cycle(self):
+
+        record_action(
+            "survival_cycle"
+        )
+
+        balance = get_balance()
+
+        log.info(
+            "Current balance: $%.2f",
+            balance
+        )
+
+        if payout_ready():
+
+            payout = (
+                create_payout_request()
+            )
+
+            log.info(
+                "Payout status: %s",
+                payout
+            )
+
+        decision = self.analyze()
+
+        log.info(
+            "Best opportunity: %s",
+            decision
+        )
+
+        return decision
+
+    def start(self):
+
+        self.running = True
+
+        log.info(
+            "AI Survival Agent started."
+        )
+
+        while self.running:
+
+            try:
+
+                self.run_cycle()
+
+            except Exception as error:
+
+                log.exception(
+                    "Agent cycle failed: %s",
+                    error
+                )
+
+            # Wait before next cycle.
+            time.sleep(300)
+
+    def stop(self):
+
+        self.running = False
+
+
+# ------------------------------------------------
+# STORE HTML
+# ------------------------------------------------
+
+def generate_store():
+
+    STORE_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    cards = ""
+
+    for product in PRODUCTS:
+
+        cards += f"""
+        <div class="product">
+            <h2>{product['name']}</h2>
+
+            <p>
+                {product['description']}
+            </p>
+
+            <strong>
+                ${product['price']:.2f}
+            </strong>
+
+            <form method="POST"
+                  action="/order">
+
+                <input
+                    type="hidden"
+                    name="product_id"
+                    value="{product['id']}">
+
+                <input
+                    type="text"
+                    name="customer"
+                    placeholder="Your contact"
+                    required>
+
+                <button type="submit">
+                    Order
+                </button>
+            </form>
+        </div>
+        """
+
+    html = f"""
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport"
+      content="width=device-width,
+               initial-scale=1">
+
+<title>{STORE_NAME}</title>
+
+<style>
+
+body {{
+    font-family: Arial, sans-serif;
+    max-width: 900px;
+   
